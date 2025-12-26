@@ -1,9 +1,0 @@
-## Interface: 11200
-## Title: Warrior Combat Manager
-## Notes: Single-file stable version for TurtleWoW
-## Author: Wargar
-## Version: 0.3.0
-## SavedVariables: WarriorCombatManagerDB
-## OptionalDeps: BigWigs
-
-Core.lua
