@@ -1644,8 +1644,8 @@ function WCM.Options:Create()
   self.scroll = scroll
   self.content = content
 
-  local function D() return WCM.Options:GetDraft() end
-  local function Preview() WCM.Options:ApplyDraftPreview() end
+  local function DVal() return WCM.Options:GetDraft() end
+  local function PreviewNow() WCM.Options:ApplyDraftPreview() end
 
   local y = -6
 
@@ -1678,7 +1678,8 @@ function WCM.Options:Create()
   getglobal(xs:GetName() .. "Text"):SetText("")
   self.xSlider = xs
 
-  local xBox = MakeEditBox(content, 90, 18, 420, y - 2)
+  -- smaller box, fits 4 digits
+  local xBox = MakeEditBox(content, 70, 18, 420, y - 2)
   self.xBox = xBox
   y = y - 54
 
@@ -1693,7 +1694,8 @@ function WCM.Options:Create()
   getglobal(ys:GetName() .. "Text"):SetText("")
   self.ySlider = ys
 
-  local yBox = MakeEditBox(content, 90, 18, 420, y - 2)
+  -- smaller box, fits 4 digits
+  local yBox = MakeEditBox(content, 70, 18, 420, y - 2)
   self.yBox = yBox
   y = y - 62
 
@@ -1731,12 +1733,14 @@ function WCM.Options:Create()
   local rightY = y
 
   MakeLabel(content, "Trinket cooldown (sec)", colR, rightY); rightY = rightY - 18
-  local tcdBox = MakeEditBox(content, 70, 18, colR + 170, rightY + 2)
+  -- smaller box, fits 4 digits
+  local tcdBox = MakeEditBox(content, 60, 18, colR + 170, rightY + 2)
   self.trinketBox = tcdBox
   rightY = rightY - 30
 
   MakeLabel(content, "Execute starts at (%)", colR, rightY); rightY = rightY - 18
-  local exBox = MakeEditBox(content, 70, 18, colR + 170, rightY + 2)
+  -- smaller box, fits 2-3 digits
+  local exBox = MakeEditBox(content, 60, 18, colR + 170, rightY + 2)
   self.execBox = exBox
   rightY = rightY - 34
 
@@ -1749,7 +1753,8 @@ function WCM.Options:Create()
   self.execZoomPctCB = execZoomPctCB
 
   MakeLabel(content, "Zoom seconds (when percent zoom is off)", colR, rightY); rightY = rightY - 18
-  local zBox = MakeEditBox(content, 70, 18, colR + 170, rightY + 2)
+  -- smaller box, fits 3 digits
+  local zBox = MakeEditBox(content, 60, 18, colR + 170, rightY + 2)
   self.zoomBox = zBox
   rightY = rightY - 18
 
@@ -1776,9 +1781,6 @@ function WCM.Options:Create()
   self.testAutoStopCB = testAutoStopCB
 
   content:SetHeight(Abs(y) + 40)
-
-  local function DVal() return WCM.Options:GetDraft() end
-  local function PreviewNow() WCM.Options:ApplyDraftPreview() end
 
   lockCB:SetScript("OnClick", function()
     DVal().locked = lockCB:GetChecked() and true or false
