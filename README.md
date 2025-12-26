@@ -1,6 +1,7 @@
 # WarriorCombatManager (WCM)
 
 WarriorCombatManager is a lightweight timeline helper for TurtleWoW (SuperWoW supported setups) that helps you **plan and execute cooldown stacking** on boss fights.
+
 ![1](https://github.com/user-attachments/assets/ed976f63-c528-409d-bf14-e2b0a9b5f941)
 
 It combines:
