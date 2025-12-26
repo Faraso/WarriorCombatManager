@@ -52,7 +52,9 @@ This addon does not play the game for you. It just makes it harder to mess up yo
   - Always on top
   - Close button (X) and ESC support
 - Auto-hide out of combat (optional).
-![3](https://github.com/user-attachments/assets/a3b1e6fd-afa5-4bcd-80d6-0c3876d47c48)
+
+![3](https://github.com/user-attachments/assets/a3b1e6fd-afa5-4bcd-80d6-0c3876d47c48) 
+
 ![4](https://github.com/user-attachments/assets/456e7cd9-ce41-4463-be52-6548bc2d95d7)
 
 ---
