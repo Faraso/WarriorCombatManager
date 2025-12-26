@@ -47,6 +47,15 @@ local function InCombat()
   return false
 end
 
+local function CopyTableShallow(src)
+  local dst = {}
+  if not src then return dst end
+  for k, v in pairs(src) do
+    dst[k] = v
+  end
+  return dst
+end
+
 Print("Core.lua loaded")
 
 -------------------------------------------------
@@ -79,6 +88,7 @@ local function InitDB()
   if db.settings.maxHistory == nil then db.settings.maxHistory = 12 end
 
   if db.settings.trinketCD == nil then db.settings.trinketCD = 120 end
+
   if db.settings.loseUseBuffer == nil then db.settings.loseUseBuffer = 2.0 end
 
   if db.settings.executeThreshold == nil then db.settings.executeThreshold = 20 end
@@ -108,8 +118,9 @@ local function InitDB()
 
   if db.settings.lockToBoss == nil then db.settings.lockToBoss = true end
 
-  -- NEW: default perfect align behavior
   if db.settings.preferAlign == nil then db.settings.preferAlign = true end
+
+  if db.settings.showAllUses == nil then db.settings.showAllUses = true end
 end
 
 local function S()
@@ -136,7 +147,6 @@ WCM.state = WCM.state or {
 
   lastPct = nil,
   lastPredictAdjust = 0,
-
   firstPct = nil,
 
   bossGUID = nil,
@@ -226,7 +236,7 @@ function WCM:PrintBossHistory(boss)
 end
 
 -------------------------------------------------
--- Boss Locking helpers
+-- Boss Locking
 -------------------------------------------------
 local function ResetBossLock()
   WCM.state.bossGUID = nil
@@ -248,7 +258,6 @@ local function TryLockBossFromUnit(unit, bossName)
       return true
     end
   end
-
   return false
 end
 
@@ -295,10 +304,8 @@ local function GetLockedBossUnit()
     if type(UnitExists) == "function" and UnitExists("target") then return "target" end
     return nil
   end
-
   if MatchLockedBoss("target") then return "target" end
   if MatchLockedBoss("focus") then return "focus" end
-
   return nil
 end
 
@@ -617,16 +624,34 @@ local function GetDefCooldownSeconds(def)
   return cd
 end
 
-local function BuildSchedule(predicted, cd, dur)
+-------------------------------------------------
+-- Schedules
+-------------------------------------------------
+local function BuildScheduleFromStart(predicted, cd)
   local out = {}
   predicted = tonumber(predicted) or 0
   cd = tonumber(cd) or 0
-  dur = tonumber(dur) or 0
   if predicted <= 0 or cd <= 0 then return out end
 
-  local t = predicted - dur
-  if t < 0 then t = 0 end
+  local t = 0
+  while t <= predicted do
+    table.insert(out, t)
+    t = t + cd
+  end
+  return out
+end
 
+local function BuildScheduleFromEnd(predicted, cd, anchorRem)
+  local out = {}
+  predicted = tonumber(predicted) or 0
+  cd = tonumber(cd) or 0
+  anchorRem = tonumber(anchorRem) or 0
+  if predicted <= 0 or cd <= 0 then return out end
+
+  local last = predicted - anchorRem
+  if last < 0 then last = 0 end
+
+  local t = last
   while t >= 0 do
     table.insert(out, 1, t)
     t = t - cd
@@ -635,22 +660,25 @@ local function BuildSchedule(predicted, cd, dur)
   return out
 end
 
-local function LoseAUseNow(elapsed, predicted, cd)
-  local buffer = S().loseUseBuffer or 2.0
-  local remaining = predicted - elapsed
-  if remaining < 0 then remaining = 0 end
-  if remaining <= (cd + buffer) then
-    return true
+local function BuildSchedule(def, predicted)
+  local cd = GetDefCooldownSeconds(def)
+
+  if def.oncePerFight then
+    local anchor = def.anchorRem or def.dur or 0
+    local one = predicted - (anchor or 0)
+    if one < 0 then one = 0 end
+    return { one }
   end
-  return false
+
+  if S().preferAlign and def.anchorRem then
+    return BuildScheduleFromEnd(predicted, cd, def.anchorRem)
+  end
+
+  return BuildScheduleFromStart(predicted, cd)
 end
 
--- NEW: find next marker after now, to enforce perfect align default
-local function NextMarkerDelta(def, elapsed, predicted)
-  local cd = GetDefCooldownSeconds(def)
-  local sched = BuildSchedule(predicted, cd, def.dur)
-  if table.getn(sched) == 0 then return nil end
-
+local function NextMarkerInSchedule(sched, elapsed)
+  if not sched or table.getn(sched) == 0 then return nil end
   local best = nil
   local i = 1
   while i <= table.getn(sched) do
@@ -664,6 +692,33 @@ local function NextMarkerDelta(def, elapsed, predicted)
     i = i + 1
   end
   return best
+end
+
+local function NearestMarkerDelta(sched, elapsed)
+  if not sched or table.getn(sched) == 0 then return nil end
+  local bestAbs, bestDt = nil, nil
+  local i = 1
+  while i <= table.getn(sched) do
+    local tMark = sched[i]
+    local dt = elapsed - tMark
+    local a = Abs(dt)
+    if (not bestAbs) or a < bestAbs then
+      bestAbs = a
+      bestDt = dt
+    end
+    i = i + 1
+  end
+  return bestDt
+end
+
+local function ScheduleHasZeroMarker(sched)
+  if not sched then return false end
+  local i = 1
+  while i <= table.getn(sched) do
+    if Abs((sched[i] or 0) - 0) < 0.001 then return true end
+    i = i + 1
+  end
+  return false
 end
 
 -------------------------------------------------
@@ -752,7 +807,7 @@ local function LivePredictTick()
 end
 
 -------------------------------------------------
--- Action Prompt logic
+-- Visible range (execute zoom)
 -------------------------------------------------
 local function GetVisibleRange(elapsed, predicted)
   local vStart = 0
@@ -784,67 +839,74 @@ local function GetVisibleRange(elapsed, predicted)
   return vStart, vEnd
 end
 
-local function IsDefEligibleOutsideExecute(def)
-  if def.oncePerFight and (not WCM.state.execute) then
-    return false
+-------------------------------------------------
+-- Eligibility rules
+-------------------------------------------------
+local function IsDefAllowedNow(def)
+  if def.oncePerFight then
+    if not WCM.state.execute then return false end
   end
   return true
 end
 
-local function FindNearestMarkerDelta(def, elapsed, predicted)
-  local cd = GetDefCooldownSeconds(def)
-  local sched = BuildSchedule(predicted, cd, def.dur)
-  if table.getn(sched) == 0 then return nil end
+-------------------------------------------------
+-- Prompt logic
+-------------------------------------------------
+local function MissedLastMarkerAndNoFuture(elapsed, predicted, cd, sched)
+  local hw = tonumber(S().highlightWindow) or 0.7
+  local buffer = tonumber(S().loseUseBuffer) or 2.0
 
-  local bestAbs = nil
-  local bestDt = nil
+  local nextDt = NextMarkerInSchedule(sched, elapsed)
+  if nextDt ~= nil then return false end
 
-  local i = 1
-  while i <= table.getn(sched) do
-    local tMark = sched[i]
-    local dt = elapsed - tMark
-    local a = Abs(dt)
-    if (not bestAbs) or a < bestAbs then
-      bestAbs = a
-      bestDt = dt
+  local remaining = predicted - elapsed
+  if remaining < 0 then remaining = 0 end
+
+  if remaining <= (cd + buffer) then
+    local dtNearest = NearestMarkerDelta(sched, elapsed)
+    if dtNearest and dtNearest > hw then
+      return true
     end
-    i = i + 1
   end
 
-  return bestDt
+  return false
 end
 
 local function GetDefPromptState(def, elapsed, predicted)
   if (not CooldownAvailable(def)) then return nil end
-  if (not IsDefEligibleOutsideExecute(def)) then return nil end
-
-  local ready = CooldownReady(def)
-  if not ready then return nil end
+  if (not IsDefAllowedNow(def)) then return nil end
+  if (not CooldownReady(def)) then return nil end
 
   local hw = tonumber(S().highlightWindow) or 0.7
   local soonW = tonumber(S().incomingWindow) or 4.0
 
-  local dtNearest = FindNearestMarkerDelta(def, elapsed, predicted)
-  if not dtNearest then
-    return "HOLD", nil
-  end
-  local absNearest = Abs(dtNearest)
-
   local cd = GetDefCooldownSeconds(def)
-  local loseNow = LoseAUseNow(elapsed, predicted, cd)
+  local sched = BuildSchedule(def, predicted)
+  if not sched or table.getn(sched) == 0 then return "HOLD", nil end
 
-  -- PERFECT ALIGN DEFAULT:
-  -- lose-a-use only triggers if there is no upcoming marker (already past last marker).
-  local nextDt = NextMarkerDelta(def, elapsed, predicted)
-  local hasUpcoming = (nextDt ~= nil)
-  local canLoseOverride = (not S().preferAlign) or (not hasUpcoming)
-
-  if loseNow and canLoseOverride then
-    return "PRESS NOW", dtNearest
+  if elapsed <= hw and ScheduleHasZeroMarker(sched) then
+    return "PRESS NOW", -elapsed
   end
+
+  local dtNearest = NearestMarkerDelta(sched, elapsed)
+  if not dtNearest then return "HOLD", nil end
+
+  local absNearest = Abs(dtNearest)
 
   if absNearest <= hw then
     return "PRESS NOW", dtNearest
+  end
+
+  if S().preferAlign then
+    if MissedLastMarkerAndNoFuture(elapsed, predicted, cd, sched) then
+      return "PRESS NOW", dtNearest
+    end
+  else
+    local remaining = predicted - elapsed
+    if remaining < 0 then remaining = 0 end
+    if remaining <= (cd + (tonumber(S().loseUseBuffer) or 2.0)) then
+      return "PRESS NOW", dtNearest
+    end
   end
 
   if absNearest <= soonW then
@@ -866,7 +928,7 @@ local function MakeFinalPrimary(elapsed, predicted)
   local i = 1
   while i <= table.getn(COOLDOWNS) do
     local def = COOLDOWNS[i]
-    if def.anchorRem and CooldownAvailable(def) and CooldownReady(def) and IsDefEligibleOutsideExecute(def) then
+    if def.anchorRem and CooldownAvailable(def) and CooldownReady(def) and IsDefAllowedNow(def) then
       local diff = Abs(remaining - def.anchorRem)
       local score = diff + (def.prio or 50) * 0.01
       if not bestScore or score < bestScore then
@@ -925,8 +987,7 @@ local function PickBestPrompt(elapsed, predicted, forcePrimaryId)
 
   local i = 1
   while i <= table.getn(COOLDOWNS) do
-    local def = COOLDOWNS[i]
-    Consider(def)
+    Consider(COOLDOWNS[i])
     i = i + 1
   end
 
@@ -959,36 +1020,6 @@ local function ApplyIconState(tex, mode, isPrimary)
     tex:SetWidth(22)
     tex:SetHeight(22)
   end
-end
-
-local function MakeLabel(parent, text, x, y)
-  local fs = parent:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
-  fs:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y)
-  fs:SetText(text)
-  return fs
-end
-
-local function MakeEditBox(parent, width, height, x, y)
-  local eb = CreateFrame("EditBox", nil, parent)
-  eb:SetAutoFocus(false)
-  eb:SetMultiLine(false)
-  eb:SetWidth(width)
-  eb:SetHeight(height)
-  eb:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y)
-  eb:SetFontObject("ChatFontNormal")
-  eb:SetTextInsets(6, 6, 2, 2)
-
-  if eb.SetBackdrop then
-    eb:SetBackdrop({
-      bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
-      edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-      tile = true, tileSize = 16, edgeSize = 12,
-      insets = { left = 3, right = 3, top = 3, bottom = 3 }
-    })
-    eb:SetBackdropColor(0, 0, 0, 0.75)
-  end
-
-  return eb
 end
 
 local function AddSpecialFrame(name)
@@ -1098,8 +1129,8 @@ function WCM.UI:Create()
   apTex:SetTexture(ICONS.UNKNOWN)
   apTex:SetAlpha(0.95)
 
-  local apText = ap:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  apText:SetPoint("TOPLEFT", ap, "TOPRIGHT", 6, -2)
+  local apText = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  apText:SetPoint("LEFT", ap, "RIGHT", 6, 0)
   apText:SetText("")
   apText:SetJustifyH("LEFT")
 
@@ -1287,15 +1318,14 @@ function WCM.UI:UpdateTimeline(elapsed, predicted)
   if S().showPrompt and promptDef and promptState then
     if S().promptOnlyPressNow and promptState ~= "PRESS NOW" then
       self.promptFrame:Hide()
-      self.promptText:SetText("")
+      if self.promptText then self.promptText:SetText("") end
     else
       self.promptFrame:Show()
       self.promptFrame:SetFrameStrata("HIGH")
       self.promptFrame:SetFrameLevel(200)
       self.promptTex:SetTexture(CooldownTexture(promptDef))
       self.promptTex:SetAlpha(0.98)
-      self.promptText:SetText(promptState)
-      self.promptText:Show()
+      if self.promptText then self.promptText:SetText(promptState) end
     end
   else
     self.promptFrame:Hide()
@@ -1306,10 +1336,9 @@ function WCM.UI:UpdateTimeline(elapsed, predicted)
   while di <= table.getn(COOLDOWNS) do
     local def = COOLDOWNS[di]
 
-    if CooldownAvailable(def) then
-      local cd = GetDefCooldownSeconds(def)
-      local sched = BuildSchedule(predicted, cd, def.dur)
+    if S().showAllUses and CooldownAvailable(def) then
       local ready = CooldownReady(def)
+      local sched = BuildSchedule(def, predicted)
 
       local si = 1
       while si <= table.getn(sched) do
@@ -1327,15 +1356,17 @@ function WCM.UI:UpdateTimeline(elapsed, predicted)
 
           local mode2 = "dim"
           if ready then mode2 = "ready" end
-          if absdt <= hw and ready then
+          if ready and absdt <= hw then
             mode2 = "now"
-          elseif absdt <= soonW and ready then
+          elseif ready and absdt <= soonW then
             mode2 = "soon"
           end
 
           local isPrimary = false
-          if promptDef and promptState == "PRESS NOW" and def.id == promptDef.id and mode2 == "now" then
-            isPrimary = true
+          if promptDef and promptState == "PRESS NOW" and def.id == promptDef.id then
+            if ready and absdt <= hw then
+              isPrimary = true
+            end
           end
 
           ApplyIconState(tex, mode2, isPrimary)
@@ -1349,9 +1380,135 @@ function WCM.UI:UpdateTimeline(elapsed, predicted)
 end
 
 -------------------------------------------------
--- Options UI
+-- Options UI (scrollable, OK/Cancel pinned)
 -------------------------------------------------
 WCM.Options = WCM.Options or {}
+
+local function MakeHeader(parent, text, x, y)
+  local fs = parent:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
+  fs:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y)
+  fs:SetText(text)
+  return fs
+end
+
+local function MakeSubHeader(parent, text, x, y)
+  local fs = parent:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+  fs:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y)
+  fs:SetText(text)
+  return fs
+end
+
+local function MakeLabel(parent, text, x, y)
+  local fs = parent:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+  fs:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y)
+  fs:SetText(text)
+  return fs
+end
+
+local function MakeEditBox(parent, width, height, x, y)
+  local eb = CreateFrame("EditBox", nil, parent)
+  eb:SetAutoFocus(false)
+  eb:SetMultiLine(false)
+  eb:SetWidth(width)
+  eb:SetHeight(height)
+  eb:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y)
+  eb:SetFontObject("ChatFontNormal")
+  eb:SetTextInsets(6, 6, 2, 2)
+
+  if eb.SetBackdrop then
+    eb:SetBackdrop({
+      bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+      edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+      tile = true, tileSize = 16, edgeSize = 12,
+      insets = { left = 3, right = 3, top = 3, bottom = 3 }
+    })
+    eb:SetBackdropColor(0, 0, 0, 0.75)
+  end
+
+  return eb
+end
+
+local function MakeDivider(parent, x, y, w)
+  local t = parent:CreateTexture(nil, "ARTWORK")
+  t:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y)
+  t:SetWidth(w)
+  t:SetHeight(2)
+  t:SetTexture(1, 1, 1, 0.12)
+  return t
+end
+
+local function MakeCheck(parent, name, label, x, y)
+  local cb = CreateFrame("CheckButton", name, parent, "UICheckButtonTemplate")
+  cb:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y)
+  local tx = getglobal(cb:GetName() .. "Text")
+  tx:SetText(label)
+  tx:ClearAllPoints()
+  tx:SetPoint("LEFT", cb, "RIGHT", 6, 1)
+  tx:SetJustifyH("LEFT")
+  return cb
+end
+
+function WCM.Options:GetDraft()
+  self.draft = self.draft or CopyTableShallow(S())
+  return self.draft
+end
+
+function WCM.Options:BeginDraft()
+  self.savedSnapshot = CopyTableShallow(S())
+  self.draft = CopyTableShallow(S())
+  self._syncing = false
+  self._committed = false
+end
+
+function WCM.Options:RevertToSnapshot()
+  if not self.savedSnapshot then return end
+  local snap = self.savedSnapshot
+  for k, v in pairs(snap) do
+    S()[k] = v
+  end
+  if WCM.UI then
+    WCM.UI:ApplyPosition()
+    WCM.UI:ApplyLock()
+  end
+end
+
+function WCM.Options:ApplyDraftPreview()
+  local d = self:GetDraft()
+
+  if WCM.UI and WCM.UI.frame then
+    if d.scale then WCM.UI:SetScale(d.scale) end
+    if d.left and d.top then
+      WCM.UI:SetPosition(d.left, d.top)
+    end
+    S().locked = d.locked and true or false
+    WCM.UI:ApplyLock()
+  end
+
+  S().autoHideOOC = d.autoHideOOC and true or false
+  S().lockToBoss = d.lockToBoss and true or false
+  S().bwEnabled = d.bwEnabled and true or false
+  S().livePredict = d.livePredict and true or false
+  S().executeBarRed = d.executeBarRed and true or false
+  S().executeZoom = d.executeZoom and true or false
+  S().executeZoomByPct = d.executeZoomByPct and true or false
+  S().testExecuteSim = d.testExecuteSim and true or false
+  S().testAutoStop = d.testAutoStop and true or false
+  S().showPrompt = d.showPrompt and true or false
+  S().promptOnlyPressNow = d.promptOnlyPressNow and true or false
+  S().showAllUses = d.showAllUses and true or false
+
+  if d.trinketCD then S().trinketCD = d.trinketCD end
+  if d.executeThreshold then S().executeThreshold = d.executeThreshold end
+  if d.executeZoomWindow then S().executeZoomWindow = d.executeZoomWindow end
+end
+
+function WCM.Options:CommitDraft()
+  local d = self:GetDraft()
+  for k, v in pairs(d) do
+    S()[k] = v
+  end
+  self._committed = true
+end
 
 function WCM.Options:UpdatePosSliderRanges()
   if not self.frame or not WCM.UI or not WCM.UI.frame then return end
@@ -1360,7 +1517,7 @@ function WCM.Options:UpdatePosSliderRanges()
   local sw = UIParent:GetWidth()
   local sh = UIParent:GetHeight()
 
-  local scale = WCM.UI.frame:GetScale() or 1
+  local scale = (self:GetDraft().scale or (WCM.UI.frame:GetScale() or 1))
   local fw = WCM.UI.frame:GetWidth() * scale
   local fh = WCM.UI.frame:GetHeight() * scale
 
@@ -1380,30 +1537,40 @@ function WCM.Options:SyncFromDB()
   if self._syncing then return end
   self._syncing = true
 
-  if WCM.UI and WCM.UI.frame and (not (S().left and S().top)) then
-    local left = WCM.UI.frame:GetLeft()
-    local top = WCM.UI.frame:GetTop()
-    if left and top then
-      S().left = left
-      S().top = top
-    end
+  local d = self:GetDraft()
+
+  if self.lockCB then self.lockCB:SetChecked(d.locked and true or false) end
+
+  if self.scaleSlider then
+    self.scaleSlider:SetValue(d.scale or 1.0)
+    getglobal(self.scaleSlider:GetName() .. "Text"):SetText(string.format("%.2f", d.scale or 1.0))
   end
 
-  if self.xBox and self.xBox.SetText then self.xBox:SetText(tostring(math.floor((S().left or 0) + 0.5))) end
-  if self.yBox and self.yBox.SetText then self.yBox:SetText(tostring(math.floor((S().top or 0) + 0.5))) end
+  if self.xBox then self.xBox:SetText(tostring(math.floor((d.left or 0) + 0.5))) end
+  if self.yBox then self.yBox:SetText(tostring(math.floor((d.top or 0) + 0.5))) end
 
-  if self.xSlider and self.xSlider.SetValue then self.xSlider:SetValue(S().left or 0) end
-  if self.ySlider and self.ySlider.SetValue then self.ySlider:SetValue(S().top or 0) end
+  if self.xSlider then self.xSlider:SetValue(d.left or 0) end
+  if self.ySlider then self.ySlider:SetValue(d.top or 0) end
 
-  if self.trinketBox and self.trinketBox.SetText then self.trinketBox:SetText(tostring(S().trinketCD or 120)) end
-  if self.execBox and self.execBox.SetText then self.execBox:SetText(tostring(S().executeThreshold or 20)) end
-  if self.zoomBox and self.zoomBox.SetText then self.zoomBox:SetText(tostring(S().executeZoomWindow or 30)) end
+  if self.trinketBox then self.trinketBox:SetText(tostring(d.trinketCD or 120)) end
+  if self.execBox then self.execBox:SetText(tostring(d.executeThreshold or 20)) end
+  if self.zoomBox then self.zoomBox:SetText(tostring(d.executeZoomWindow or 30)) end
 
-  if self.autoHideCB and self.autoHideCB.SetChecked then self.autoHideCB:SetChecked(S().autoHideOOC and true or false) end
-  if self.lockBossCB and self.lockBossCB.SetChecked then self.lockBossCB:SetChecked(S().lockToBoss and true or false) end
+  if self.autoHideCB then self.autoHideCB:SetChecked(d.autoHideOOC and true or false) end
+  if self.lockBossCB then self.lockBossCB:SetChecked(d.lockToBoss and true or false) end
 
-  if self.showPromptCB and self.showPromptCB.SetChecked then self.showPromptCB:SetChecked(S().showPrompt and true or false) end
-  if self.promptOnlyNowCB and self.promptOnlyNowCB.SetChecked then self.promptOnlyNowCB:SetChecked(S().promptOnlyPressNow and true or false) end
+  if self.bwCB then self.bwCB:SetChecked(d.bwEnabled and true or false) end
+  if self.liveCB then self.liveCB:SetChecked(d.livePredict and true or false) end
+  if self.execRedCB then self.execRedCB:SetChecked(d.executeBarRed and true or false) end
+
+  if self.execZoomCB then self.execZoomCB:SetChecked(d.executeZoom and true or false) end
+  if self.execZoomPctCB then self.execZoomPctCB:SetChecked(d.executeZoomByPct and true or false) end
+  if self.testExecCB then self.testExecCB:SetChecked(d.testExecuteSim and true or false) end
+  if self.testAutoStopCB then self.testAutoStopCB:SetChecked(d.testAutoStop and true or false) end
+
+  if self.showPromptCB then self.showPromptCB:SetChecked(d.showPrompt and true or false) end
+  if self.promptOnlyNowCB then self.promptOnlyNowCB:SetChecked(d.promptOnlyPressNow and true or false) end
+  if self.allUsesCB then self.allUsesCB:SetChecked(d.showAllUses and true or false) end
 
   self._syncing = false
 end
@@ -1412,7 +1579,7 @@ function WCM.Options:Create()
   if self.frame then return end
 
   local f = CreateFrame("Frame", "WCM_Options", UIParent)
-  f:SetWidth(520)
+  f:SetWidth(600)
   f:SetHeight(520)
   f:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
 
@@ -1423,293 +1590,370 @@ function WCM.Options:Create()
       tile = true, tileSize = 16, edgeSize = 16,
       insets = { left = 4, right = 4, top = 4, bottom = 4 }
     })
-    f:SetBackdropColor(0, 0, 0, 0.90)
+    f:SetBackdropColor(0, 0, 0, 0.92)
   end
 
   f:SetFrameStrata("FULLSCREEN_DIALOG")
   f:SetFrameLevel(999)
-
   f:SetMovable(true)
   f:EnableMouse(true)
   f:RegisterForDrag("LeftButton")
   f:SetClampedToScreen(true)
 
-  f:SetScript("OnDragStart", function()
-    f:StartMoving()
-  end)
-
-  f:SetScript("OnDragStop", function()
-    f:StopMovingOrSizing()
-  end)
+  f:SetScript("OnDragStart", function() f:StartMoving() end)
+  f:SetScript("OnDragStop", function() f:StopMovingOrSizing() end)
 
   AddSpecialFrame("WCM_Options")
   f:Hide()
 
-  local title = f:CreateFontString(nil, "ARTWORK", "GameFontNormal")
-  title:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -10)
-  title:SetText("WCM Options")
+  MakeHeader(f, "WCM Options", 12, -12)
 
   local close = CreateFrame("Button", "WCM_Options_Close", f, "UIPanelCloseButton")
   close:SetPoint("TOPRIGHT", f, "TOPRIGHT", -4, -4)
   close:SetScript("OnClick", function() f:Hide() end)
 
-  local lock = CreateFrame("CheckButton", "WCM_Options_Lock", f, "UICheckButtonTemplate")
-  lock:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -34)
-  getglobal(lock:GetName() .. "Text"):SetText("Locked")
-  lock:SetChecked(S().locked and true or false)
-  lock:SetScript("OnClick", function()
-    S().locked = lock:GetChecked() and true or false
-    if WCM.UI and WCM.UI.ApplyLock then WCM.UI:ApplyLock() end
-  end)
+  MakeDivider(f, 12, -40, 576)
 
-  MakeLabel(f, "Scale", 10, -62)
-  local scale = CreateFrame("Slider", "WCM_Options_Scale", f, "OptionsSliderTemplate")
-  scale:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -80)
-  scale:SetWidth(300)
+  local footer = CreateFrame("Frame", nil, f)
+  footer:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 12, 12)
+  footer:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -12, 12)
+  footer:SetHeight(30)
+
+  local ok = CreateFrame("Button", "WCM_Options_OK", footer, "UIPanelButtonTemplate")
+  ok:SetWidth(120)
+  ok:SetHeight(22)
+  ok:SetPoint("RIGHT", footer, "RIGHT", 0, 0)
+  ok:SetText("OK")
+
+  local cancel = CreateFrame("Button", "WCM_Options_Cancel", footer, "UIPanelButtonTemplate")
+  cancel:SetWidth(120)
+  cancel:SetHeight(22)
+  cancel:SetPoint("RIGHT", ok, "LEFT", -10, 0)
+  cancel:SetText("Cancel")
+
+  local scroll = CreateFrame("ScrollFrame", "WCM_Options_Scroll", f, "UIPanelScrollFrameTemplate")
+  scroll:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -48)
+  scroll:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -34, 48)
+
+  local content = CreateFrame("Frame", "WCM_Options_Content", scroll)
+  content:SetWidth(540)
+  content:SetHeight(820)
+  scroll:SetScrollChild(content)
+
+  self.frame = f
+  self.scroll = scroll
+  self.content = content
+
+  local function D() return WCM.Options:GetDraft() end
+  local function Preview() WCM.Options:ApplyDraftPreview() end
+
+  local y = -6
+
+  MakeSubHeader(content, "Layout", 0, y); y = y - 26
+
+  local lockCB = MakeCheck(content, "WCM_Options_Lock", "Locked. Uncheck to drag the bar.", 0, y); y = y - 34
+  self.lockCB = lockCB
+
+  MakeLabel(content, "Scale", 0, y); y = y - 18
+  local scale = CreateFrame("Slider", "WCM_Options_Scale", content, "OptionsSliderTemplate")
+  scale:SetPoint("TOPLEFT", content, "TOPLEFT", 0, y)
+  scale:SetWidth(340)
   scale:SetMinMaxValues(0.60, 1.80)
   scale:SetValueStep(0.05)
   if scale.SetObeyStepOnDrag then scale:SetObeyStepOnDrag(true) end
-  scale:SetValue(S().scale)
   getglobal(scale:GetName() .. "Low"):SetText("0.60")
   getglobal(scale:GetName() .. "High"):SetText("1.80")
-  getglobal(scale:GetName() .. "Text"):SetText(string.format("%.2f", S().scale))
-  scale:SetScript("OnValueChanged", function()
-    local v = Round2(scale:GetValue())
-    S().scale = v
-    getglobal(scale:GetName() .. "Text"):SetText(string.format("%.2f", v))
-    if WCM.UI and WCM.UI.SetScale then WCM.UI:SetScale(v) end
-    WCM.Options:UpdatePosSliderRanges()
-    WCM.Options:SyncFromDB()
-  end)
+  getglobal(scale:GetName() .. "Text"):SetText("1.00")
+  self.scaleSlider = scale
+  y = y - 50
 
-  MakeLabel(f, "Position X (left)", 10, -120)
-  local xs = CreateFrame("Slider", "WCM_Options_PosX", f, "OptionsSliderTemplate")
-  xs:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -140)
-  xs:SetWidth(350)
+  MakeLabel(content, "Position X (left)", 0, y); y = y - 18
+  local xs = CreateFrame("Slider", "WCM_Options_PosX", content, "OptionsSliderTemplate")
+  xs:SetPoint("TOPLEFT", content, "TOPLEFT", 0, y)
+  xs:SetWidth(400)
   xs:SetValueStep(1)
   if xs.SetObeyStepOnDrag then xs:SetObeyStepOnDrag(true) end
   getglobal(xs:GetName() .. "Low"):SetText("")
   getglobal(xs:GetName() .. "High"):SetText("")
   getglobal(xs:GetName() .. "Text"):SetText("")
+  self.xSlider = xs
 
-  local xBox = MakeEditBox(f, 90, 18, 380, -142)
-  xBox:SetText(tostring(math.floor((S().left or 0) + 0.5)))
+  local xBox = MakeEditBox(content, 90, 18, 420, y - 2)
+  self.xBox = xBox
+  y = y - 54
 
-  MakeLabel(f, "Position Y (top)", 10, -172)
-  local ys = CreateFrame("Slider", "WCM_Options_PosY", f, "OptionsSliderTemplate")
-  ys:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -192)
-  ys:SetWidth(350)
+  MakeLabel(content, "Position Y (top)", 0, y); y = y - 18
+  local ys = CreateFrame("Slider", "WCM_Options_PosY", content, "OptionsSliderTemplate")
+  ys:SetPoint("TOPLEFT", content, "TOPLEFT", 0, y)
+  ys:SetWidth(400)
   ys:SetValueStep(1)
   if ys.SetObeyStepOnDrag then ys:SetObeyStepOnDrag(true) end
   getglobal(ys:GetName() .. "Low"):SetText("")
   getglobal(ys:GetName() .. "High"):SetText("")
   getglobal(ys:GetName() .. "Text"):SetText("")
+  self.ySlider = ys
 
-  local yBox = MakeEditBox(f, 90, 18, 380, -194)
-  yBox:SetText(tostring(math.floor((S().top or 0) + 0.5)))
+  local yBox = MakeEditBox(content, 90, 18, 420, y - 2)
+  self.yBox = yBox
+  y = y - 62
+
+  MakeDivider(content, 0, y, 540); y = y - 18
+
+  MakeSubHeader(content, "Behavior", 0, y); y = y - 26
+  local autoHideCB = MakeCheck(content, "WCM_Options_AutoHide", "Hide the bar out of combat", 0, y); y = y - 26
+  local lockBossCB = MakeCheck(content, "WCM_Options_LockBoss", "Boss-only prediction. Ignore adds.", 0, y); y = y - 34
+  self.autoHideCB = autoHideCB
+  self.lockBossCB = lockBossCB
+
+  MakeDivider(content, 0, y, 540); y = y - 18
+
+  -------------------------------------------------
+  -- Prediction and Execute (fixed layout)
+  -------------------------------------------------
+  MakeSubHeader(content, "Prediction and Execute", 0, y); y = y - 26
+
+  local colL = 0
+  local colR = 320
+
+  local rowTop = y
+
+  local bwCB = MakeCheck(content, "WCM_Options_BW", "Use BigWigs boss times (history)", colL, rowTop)
+  rowTop = rowTop - 26
+  local liveCB = MakeCheck(content, "WCM_Options_Live", "Live adjust prediction from boss HP drop", colL, rowTop)
+  rowTop = rowTop - 26
+  local execRedCB = MakeCheck(content, "WCM_Options_ExecRed", "Make the bar red in execute phase", colL, rowTop)
+  rowTop = rowTop - 34
+
+  self.bwCB = bwCB
+  self.liveCB = liveCB
+  self.execRedCB = execRedCB
+
+  local rightY = y
+
+  MakeLabel(content, "Trinket cooldown (sec)", colR, rightY); rightY = rightY - 18
+  local tcdBox = MakeEditBox(content, 70, 18, colR + 170, rightY + 2)
+  self.trinketBox = tcdBox
+  rightY = rightY - 30
+
+  MakeLabel(content, "Execute starts at (%)", colR, rightY); rightY = rightY - 18
+  local exBox = MakeEditBox(content, 70, 18, colR + 170, rightY + 2)
+  self.execBox = exBox
+  rightY = rightY - 34
+
+  local execZoomCB = MakeCheck(content, "WCM_Options_ExecZoom", "Zoom timeline in execute", colR, rightY)
+  rightY = rightY - 26
+  local execZoomPctCB = MakeCheck(content, "WCM_Options_ExecZoomPct", "Zoom by execute percent", colR, rightY)
+  rightY = rightY - 30
+
+  self.execZoomCB = execZoomCB
+  self.execZoomPctCB = execZoomPctCB
+
+  MakeLabel(content, "Zoom seconds (when percent zoom is off)", colR, rightY); rightY = rightY - 18
+  local zBox = MakeEditBox(content, 70, 18, colR + 170, rightY + 2)
+  self.zoomBox = zBox
+  rightY = rightY - 18
+
+  y = rowTop
+  if rightY < y then y = rightY end
+  y = y - 10
+
+  MakeDivider(content, 0, y, 540); y = y - 18
+
+  MakeSubHeader(content, "UI", 0, y); y = y - 26
+  local showPromptCB = MakeCheck(content, "WCM_Options_ShowPrompt", "Show Action Prompt icon", 0, y); y = y - 26
+  local promptOnlyNowCB = MakeCheck(content, "WCM_Options_PromptOnlyNow", "Only show it when you should press now", 0, y); y = y - 26
+  local allUsesCB = MakeCheck(content, "WCM_Options_AllUses", "Show every scheduled use on the timeline", 0, y); y = y - 34
+  self.showPromptCB = showPromptCB
+  self.promptOnlyNowCB = promptOnlyNowCB
+  self.allUsesCB = allUsesCB
+
+  MakeDivider(content, 0, y, 540); y = y - 18
+
+  MakeSubHeader(content, "Test", 0, y); y = y - 26
+  local testExecCB = MakeCheck(content, "WCM_Options_TestExec", "Simulate execute during manual test", 0, y); y = y - 26
+  local testAutoStopCB = MakeCheck(content, "WCM_Options_TestStop", "Stop test automatically at predicted time", 0, y); y = y - 34
+  self.testExecCB = testExecCB
+  self.testAutoStopCB = testAutoStopCB
+
+  content:SetHeight(Abs(y) + 40)
+
+  local function DVal() return WCM.Options:GetDraft() end
+  local function PreviewNow() WCM.Options:ApplyDraftPreview() end
+
+  lockCB:SetScript("OnClick", function()
+    DVal().locked = lockCB:GetChecked() and true or false
+    PreviewNow()
+  end)
+
+  scale:SetScript("OnValueChanged", function()
+    if WCM.Options._syncing then return end
+    local v = Round2(scale:GetValue())
+    DVal().scale = v
+    getglobal(scale:GetName() .. "Text"):SetText(string.format("%.2f", v))
+    WCM.Options:UpdatePosSliderRanges()
+    PreviewNow()
+    WCM.Options:SyncFromDB()
+  end)
 
   xs:SetScript("OnValueChanged", function()
     if WCM.Options._syncing then return end
     local v = math.floor(xs:GetValue() + 0.5)
-    S().left = v
+    DVal().left = v
     if xBox and xBox.SetText then xBox:SetText(tostring(v)) end
-    if WCM.UI and WCM.UI.SetPosition and S().top then WCM.UI:SetPosition(S().left, S().top) end
+    PreviewNow()
   end)
 
   ys:SetScript("OnValueChanged", function()
     if WCM.Options._syncing then return end
     local v = math.floor(ys:GetValue() + 0.5)
-    S().top = v
+    DVal().top = v
     if yBox and yBox.SetText then yBox:SetText(tostring(v)) end
-    if WCM.UI and WCM.UI.SetPosition and S().left then WCM.UI:SetPosition(S().left, S().top) end
+    PreviewNow()
   end)
 
   xBox:SetScript("OnEnterPressed", function()
     local v = tonumber(xBox:GetText())
-    if v and S().top then
-      WCM.UI:SetPosition(v, S().top)
+    if v then
+      DVal().left = v
+      PreviewNow()
       WCM.Options:SyncFromDB()
-      Print("Position set")
+      Print("Position updated (preview)")
     end
     xBox:ClearFocus()
   end)
 
   yBox:SetScript("OnEnterPressed", function()
     local v = tonumber(yBox:GetText())
-    if v and S().left then
-      WCM.UI:SetPosition(S().left, v)
+    if v then
+      DVal().top = v
+      PreviewNow()
       WCM.Options:SyncFromDB()
-      Print("Position set")
+      Print("Position updated (preview)")
     end
     yBox:ClearFocus()
   end)
 
-  local ah = CreateFrame("CheckButton", "WCM_Options_AutoHide", f, "UICheckButtonTemplate")
-  ah:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -224)
-  getglobal(ah:GetName() .. "Text"):SetText("Auto-hide out of combat")
-  ah:SetChecked(S().autoHideOOC and true or false)
-  ah:SetScript("OnClick", function()
-    S().autoHideOOC = ah:GetChecked() and true or false
-    Print("Auto-hide out of combat " .. (S().autoHideOOC and "enabled" or "disabled"))
-    if WCM.UI then
-      if S().autoHideOOC and (not InCombat()) and (not WCM.state.running) then
-        WCM.UI:Hide()
-      else
-        WCM.UI:Show(true)
-      end
-    end
+  autoHideCB:SetScript("OnClick", function()
+    DVal().autoHideOOC = autoHideCB:GetChecked() and true or false
+    PreviewNow()
   end)
 
-  local lb = CreateFrame("CheckButton", "WCM_Options_LockBoss", f, "UICheckButtonTemplate")
-  lb:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -248)
-  getglobal(lb:GetName() .. "Text"):SetText("Lock prediction to boss (ignore adds)")
-  lb:SetChecked(S().lockToBoss and true or false)
-  lb:SetScript("OnClick", function()
-    S().lockToBoss = lb:GetChecked() and true or false
-    Print("Lock to boss " .. (S().lockToBoss and "enabled" or "disabled"))
+  lockBossCB:SetScript("OnClick", function()
+    DVal().lockToBoss = lockBossCB:GetChecked() and true or false
+    PreviewNow()
   end)
 
-  MakeLabel(f, "Trinket CD (sec)", 10, -279)
-  local tcdBox = MakeEditBox(f, 70, 18, 130, -283)
-  tcdBox:SetText(tostring(S().trinketCD or 120))
+  bwCB:SetScript("OnClick", function()
+    DVal().bwEnabled = bwCB:GetChecked() and true or false
+    PreviewNow()
+  end)
+
+  liveCB:SetScript("OnClick", function()
+    DVal().livePredict = liveCB:GetChecked() and true or false
+    PreviewNow()
+  end)
+
+  execRedCB:SetScript("OnClick", function()
+    DVal().executeBarRed = execRedCB:GetChecked() and true or false
+    PreviewNow()
+  end)
+
+  execZoomCB:SetScript("OnClick", function()
+    DVal().executeZoom = execZoomCB:GetChecked() and true or false
+    PreviewNow()
+  end)
+
+  execZoomPctCB:SetScript("OnClick", function()
+    DVal().executeZoomByPct = execZoomPctCB:GetChecked() and true or false
+    PreviewNow()
+  end)
+
+  testExecCB:SetScript("OnClick", function()
+    DVal().testExecuteSim = testExecCB:GetChecked() and true or false
+    PreviewNow()
+  end)
+
+  testAutoStopCB:SetScript("OnClick", function()
+    DVal().testAutoStop = testAutoStopCB:GetChecked() and true or false
+    PreviewNow()
+  end)
+
+  showPromptCB:SetScript("OnClick", function()
+    DVal().showPrompt = showPromptCB:GetChecked() and true or false
+    PreviewNow()
+  end)
+
+  promptOnlyNowCB:SetScript("OnClick", function()
+    DVal().promptOnlyPressNow = promptOnlyNowCB:GetChecked() and true or false
+    PreviewNow()
+  end)
+
+  allUsesCB:SetScript("OnClick", function()
+    DVal().showAllUses = allUsesCB:GetChecked() and true or false
+    PreviewNow()
+  end)
+
   tcdBox:SetScript("OnEnterPressed", function()
     local v = tonumber(tcdBox:GetText())
     if v then
       v = Clamp(v, 30, 600)
-      S().trinketCD = v
+      DVal().trinketCD = v
       tcdBox:SetText(tostring(v))
-      Print("Trinket CD set to " .. tostring(v))
+      PreviewNow()
+      Print("Trinket cooldown updated (preview)")
     end
     tcdBox:ClearFocus()
   end)
 
-  MakeLabel(f, "Execute threshold (%)", 240, -279)
-  local exBox = MakeEditBox(f, 60, 18, 375, -283)
-  exBox:SetText(tostring(S().executeThreshold or 20))
   exBox:SetScript("OnEnterPressed", function()
     local v = tonumber(exBox:GetText())
     if v then
       v = Clamp(v, 1, 99)
-      S().executeThreshold = v
+      DVal().executeThreshold = v
       exBox:SetText(tostring(v))
-      Print("Execute threshold set to " .. tostring(v) .. "%")
+      PreviewNow()
+      Print("Execute threshold updated (preview)")
     end
     exBox:ClearFocus()
   end)
 
-  local bw = CreateFrame("CheckButton", "WCM_Options_BW", f, "UICheckButtonTemplate")
-  bw:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -310)
-  getglobal(bw:GetName() .. "Text"):SetText("Enable BigWigs integration")
-  bw:SetChecked(S().bwEnabled and true or false)
-  bw:SetScript("OnClick", function()
-    S().bwEnabled = bw:GetChecked() and true or false
-    Print("BigWigs integration " .. (S().bwEnabled and "enabled" or "disabled"))
-  end)
-
-  local lp = CreateFrame("CheckButton", "WCM_Options_LivePredict", f, "UICheckButtonTemplate")
-  lp:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -336)
-  getglobal(lp:GetName() .. "Text"):SetText("Live prediction adjustment")
-  lp:SetChecked(S().livePredict and true or false)
-  lp:SetScript("OnClick", function()
-    S().livePredict = lp:GetChecked() and true or false
-    Print("Live prediction " .. (S().livePredict and "enabled" or "disabled"))
-  end)
-
-  local xr = CreateFrame("CheckButton", "WCM_Options_ExecRed", f, "UICheckButtonTemplate")
-  xr:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -362)
-  getglobal(xr:GetName() .. "Text"):SetText("Execute makes bar red")
-  xr:SetChecked(S().executeBarRed and true or false)
-  xr:SetScript("OnClick", function()
-    S().executeBarRed = xr:GetChecked() and true or false
-    Print("Execute bar red " .. (S().executeBarRed and "enabled" or "disabled"))
-  end)
-
-  local ez = CreateFrame("CheckButton", "WCM_Options_ExecZoom", f, "UICheckButtonTemplate")
-  ez:SetPoint("TOPLEFT", f, "TOPLEFT", 240, -310)
-  getglobal(ez:GetName() .. "Text"):SetText("Execute zoom enabled")
-  ez:SetChecked(S().executeZoom and true or false)
-  ez:SetScript("OnClick", function()
-    S().executeZoom = ez:GetChecked() and true or false
-    Print("Execute zoom " .. (S().executeZoom and "enabled" or "disabled"))
-  end)
-
-  local ezp = CreateFrame("CheckButton", "WCM_Options_ExecZoomPct", f, "UICheckButtonTemplate")
-  ezp:SetPoint("TOPLEFT", f, "TOPLEFT", 240, -336)
-  getglobal(ezp:GetName() .. "Text"):SetText("Zoom by execute percent")
-  ezp:SetChecked(S().executeZoomByPct and true or false)
-  ezp:SetScript("OnClick", function()
-    S().executeZoomByPct = ezp:GetChecked() and true or false
-    Print("Execute zoom mode = " .. (S().executeZoomByPct and "percent" or "seconds"))
-  end)
-
-  MakeLabel(f, "Zoom seconds (if percent off)", 240, -362)
-  local zBox = MakeEditBox(f, 60, 18, 420, -366)
-  zBox:SetText(tostring(S().executeZoomWindow or 30))
   zBox:SetScript("OnEnterPressed", function()
     local v = tonumber(zBox:GetText())
     if v then
       v = Clamp(v, 10, 120)
-      S().executeZoomWindow = v
+      DVal().executeZoomWindow = v
       zBox:SetText(tostring(v))
-      Print("Execute zoom seconds set to " .. tostring(v))
+      PreviewNow()
+      Print("Execute zoom seconds updated (preview)")
     end
     zBox:ClearFocus()
   end)
 
-  local te = CreateFrame("CheckButton", "WCM_Options_TestExec", f, "UICheckButtonTemplate")
-  te:SetPoint("TOPLEFT", f, "TOPLEFT", 240, -388)
-  getglobal(te:GetName() .. "Text"):SetText("Simulate execute in manual test")
-  te:SetChecked(S().testExecuteSim and true or false)
-  te:SetScript("OnClick", function()
-    S().testExecuteSim = te:GetChecked() and true or false
-    Print("Test execute simulation " .. (S().testExecuteSim and "enabled" or "disabled"))
+  ok:SetScript("OnClick", function()
+    WCM.Options:CommitDraft()
+    Print("Options saved")
+    f:Hide()
   end)
 
-  local tas = CreateFrame("CheckButton", "WCM_Options_TestAS", f, "UICheckButtonTemplate")
-  tas:SetPoint("TOPLEFT", f, "TOPLEFT", 240, -414)
-  getglobal(tas:GetName() .. "Text"):SetText("Auto stop test at predicted")
-  tas:SetChecked(S().testAutoStop and true or false)
-  tas:SetScript("OnClick", function()
-    S().testAutoStop = tas:GetChecked() and true or false
-    Print("Test auto stop " .. (S().testAutoStop and "enabled" or "disabled"))
+  cancel:SetScript("OnClick", function()
+    f:Hide()
   end)
-
-  local sp = CreateFrame("CheckButton", "WCM_Options_ShowPrompt", f, "UICheckButtonTemplate")
-  sp:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -448)
-  getglobal(sp:GetName() .. "Text"):SetText("Action Prompt enabled (left icon)")
-  sp:SetChecked(S().showPrompt and true or false)
-  sp:SetScript("OnClick", function()
-    S().showPrompt = sp:GetChecked() and true or false
-    Print("Action prompt " .. (S().showPrompt and "enabled" or "disabled"))
-  end)
-
-  local pnow = CreateFrame("CheckButton", "WCM_Options_PromptOnlyNow", f, "UICheckButtonTemplate")
-  pnow:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -474)
-  getglobal(pnow:GetName() .. "Text"):SetText("Prompt only when PRESS NOW")
-  pnow:SetChecked(S().promptOnlyPressNow and true or false)
-  pnow:SetScript("OnClick", function()
-    S().promptOnlyPressNow = pnow:GetChecked() and true or false
-    Print("Prompt mode = " .. (S().promptOnlyPressNow and "press-now only" or "always show states"))
-  end)
-
-  self.frame = f
-  self.xSlider = xs
-  self.ySlider = ys
-  self.xBox = xBox
-  self.yBox = yBox
-  self.trinketBox = tcdBox
-  self.execBox = exBox
-  self.zoomBox = zBox
-  self.autoHideCB = ah
-  self.lockBossCB = lb
-  self.showPromptCB = sp
-  self.promptOnlyNowCB = pnow
 
   f:SetScript("OnShow", function()
+    WCM.Options:BeginDraft()
     WCM.Options:UpdatePosSliderRanges()
     WCM.Options:SyncFromDB()
+    PreviewNow()
     f:SetFrameStrata("FULLSCREEN_DIALOG")
     f:SetFrameLevel(999)
+  end)
+
+  f:SetScript("OnHide", function()
+    if not WCM.Options._committed then
+      WCM.Options:RevertToSnapshot()
+      Print("Options canceled")
+    end
+    WCM.Options.draft = nil
   end)
 end
 
@@ -1921,6 +2165,7 @@ SlashCmdList["WCM"] = function(msg)
     end
   elseif msg == "diag" then
     Print("diag: preferAlign=" .. tostring(S().preferAlign) ..
+      " showAllUses=" .. tostring(S().showAllUses) ..
       " autoHideOOC=" .. tostring(S().autoHideOOC) ..
       " inCombat=" .. tostring(InCombat()) ..
       " running=" .. tostring(WCM.state.running) ..
