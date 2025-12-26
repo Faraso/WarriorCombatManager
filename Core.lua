@@ -91,7 +91,10 @@ local function InitDB()
   if db.settings.livePredictMinDrop == nil then db.settings.livePredictMinDrop = 3.0 end
 
   if db.settings.strictFinalStack == nil then db.settings.strictFinalStack = true end
-  if db.settings.showNextAction == nil then db.settings.showNextAction = true end
+
+  if db.settings.showPrompt == nil then db.settings.showPrompt = true end
+  if db.settings.promptOnlyPressNow == nil then db.settings.promptOnlyPressNow = true end
+
   if db.settings.executeBarRed == nil then db.settings.executeBarRed = true end
 
   if db.settings.executeZoom == nil then db.settings.executeZoom = true end
@@ -104,6 +107,9 @@ local function InitDB()
   if db.settings.autoHideOOC == nil then db.settings.autoHideOOC = true end
 
   if db.settings.lockToBoss == nil then db.settings.lockToBoss = true end
+
+  -- NEW: default perfect align behavior
+  if db.settings.preferAlign == nil then db.settings.preferAlign = true end
 end
 
 local function S()
@@ -562,7 +568,7 @@ local COOLDOWNS = {
   { id="T13", kind="trinket", slot=13, cdKey="trinketCD", dur=20, anchorRem=20, prio=2 },
   { id="T14", kind="trinket", slot=14, cdKey="trinketCD", dur=20, anchorRem=20, prio=2 },
   { id="BF", kind="spell", name=SPELLS.BF, icon=ICONS.BF, cd=120, dur=15, anchorRem=15, prio=3 },
-  { id="RECK", kind="spell", name=SPELLS.RECK, icon=ICONS.RECK, cd=1800, dur=15, anchorRem=15, prio=4 },
+  { id="RECK", kind="spell", name=SPELLS.RECK, icon=ICONS.RECK, cd=1800, dur=15, anchorRem=15, prio=4, oncePerFight=true },
   { id="BR", kind="spell", name=SPELLS.BR, icon=ICONS.BR, cd=60, dur=10, anchorRem=10, prio=5 },
 }
 
@@ -603,6 +609,14 @@ local function CooldownTexture(def)
   return ICONS.UNKNOWN
 end
 
+local function GetDefCooldownSeconds(def)
+  local cd = def.cd
+  if def.cdKey == "trinketCD" then
+    cd = tonumber(S().trinketCD) or 120
+  end
+  return cd
+end
+
 local function BuildSchedule(predicted, cd, dur)
   local out = {}
   predicted = tonumber(predicted) or 0
@@ -629,6 +643,27 @@ local function LoseAUseNow(elapsed, predicted, cd)
     return true
   end
   return false
+end
+
+-- NEW: find next marker after now, to enforce perfect align default
+local function NextMarkerDelta(def, elapsed, predicted)
+  local cd = GetDefCooldownSeconds(def)
+  local sched = BuildSchedule(predicted, cd, def.dur)
+  if table.getn(sched) == 0 then return nil end
+
+  local best = nil
+  local i = 1
+  while i <= table.getn(sched) do
+    local tMark = sched[i]
+    if tMark >= elapsed then
+      local dt = tMark - elapsed
+      if (not best) or dt < best then
+        best = dt
+      end
+    end
+    i = i + 1
+  end
+  return best
 end
 
 -------------------------------------------------
@@ -717,6 +752,188 @@ local function LivePredictTick()
 end
 
 -------------------------------------------------
+-- Action Prompt logic
+-------------------------------------------------
+local function GetVisibleRange(elapsed, predicted)
+  local vStart = 0
+  local vEnd = predicted
+
+  if S().executeZoom and WCM.state.execute then
+    if S().executeZoomByPct then
+      local thr = tonumber(S().executeThreshold) or 20
+      thr = Clamp(thr, 1, 99)
+      local win = predicted * (thr / 100)
+      if win < 5 then win = 5 end
+      vEnd = predicted
+      vStart = predicted - win
+      if vStart < 0 then vStart = 0 end
+    else
+      local win2 = tonumber(S().executeZoomWindow) or 30
+      win2 = Clamp(win2, 10, 120)
+      vEnd = predicted
+      vStart = predicted - win2
+      if vStart < 0 then vStart = 0 end
+    end
+  end
+
+  if vEnd <= vStart then
+    vStart = 0
+    vEnd = predicted
+  end
+
+  return vStart, vEnd
+end
+
+local function IsDefEligibleOutsideExecute(def)
+  if def.oncePerFight and (not WCM.state.execute) then
+    return false
+  end
+  return true
+end
+
+local function FindNearestMarkerDelta(def, elapsed, predicted)
+  local cd = GetDefCooldownSeconds(def)
+  local sched = BuildSchedule(predicted, cd, def.dur)
+  if table.getn(sched) == 0 then return nil end
+
+  local bestAbs = nil
+  local bestDt = nil
+
+  local i = 1
+  while i <= table.getn(sched) do
+    local tMark = sched[i]
+    local dt = elapsed - tMark
+    local a = Abs(dt)
+    if (not bestAbs) or a < bestAbs then
+      bestAbs = a
+      bestDt = dt
+    end
+    i = i + 1
+  end
+
+  return bestDt
+end
+
+local function GetDefPromptState(def, elapsed, predicted)
+  if (not CooldownAvailable(def)) then return nil end
+  if (not IsDefEligibleOutsideExecute(def)) then return nil end
+
+  local ready = CooldownReady(def)
+  if not ready then return nil end
+
+  local hw = tonumber(S().highlightWindow) or 0.7
+  local soonW = tonumber(S().incomingWindow) or 4.0
+
+  local dtNearest = FindNearestMarkerDelta(def, elapsed, predicted)
+  if not dtNearest then
+    return "HOLD", nil
+  end
+  local absNearest = Abs(dtNearest)
+
+  local cd = GetDefCooldownSeconds(def)
+  local loseNow = LoseAUseNow(elapsed, predicted, cd)
+
+  -- PERFECT ALIGN DEFAULT:
+  -- lose-a-use only triggers if there is no upcoming marker (already past last marker).
+  local nextDt = NextMarkerDelta(def, elapsed, predicted)
+  local hasUpcoming = (nextDt ~= nil)
+  local canLoseOverride = (not S().preferAlign) or (not hasUpcoming)
+
+  if loseNow and canLoseOverride then
+    return "PRESS NOW", dtNearest
+  end
+
+  if absNearest <= hw then
+    return "PRESS NOW", dtNearest
+  end
+
+  if absNearest <= soonW then
+    return "SOON", dtNearest
+  end
+
+  return "HOLD", dtNearest
+end
+
+local function MakeFinalPrimary(elapsed, predicted)
+  if not S().strictFinalStack then return nil end
+  local remaining = predicted - elapsed
+  if remaining < 0 then remaining = 0 end
+  if remaining > 30 then return nil end
+
+  local bestId = nil
+  local bestScore = nil
+
+  local i = 1
+  while i <= table.getn(COOLDOWNS) do
+    local def = COOLDOWNS[i]
+    if def.anchorRem and CooldownAvailable(def) and CooldownReady(def) and IsDefEligibleOutsideExecute(def) then
+      local diff = Abs(remaining - def.anchorRem)
+      local score = diff + (def.prio or 50) * 0.01
+      if not bestScore or score < bestScore then
+        bestScore = score
+        bestId = def.id
+      end
+    end
+    i = i + 1
+  end
+
+  return bestId
+end
+
+local function PickBestPrompt(elapsed, predicted, forcePrimaryId)
+  local bestDef = nil
+  local bestState = nil
+  local bestScore = nil
+
+  local primaryDef = nil
+  if forcePrimaryId then
+    local pi = 1
+    while pi <= table.getn(COOLDOWNS) do
+      if COOLDOWNS[pi].id == forcePrimaryId then
+        primaryDef = COOLDOWNS[pi]
+        break
+      end
+      pi = pi + 1
+    end
+  end
+
+  local function Consider(def)
+    local state, dt = GetDefPromptState(def, elapsed, predicted)
+    if not state then return end
+
+    local prio = def.prio or 50
+    local score = 9999
+
+    if state == "PRESS NOW" then
+      score = 0 + prio * 0.01
+    elseif state == "SOON" then
+      score = 10 + prio * 0.01 + (Abs(dt or 0) * 0.05)
+    else
+      score = 50 + prio * 0.01 + (Abs(dt or 0) * 0.02)
+    end
+
+    if (not bestScore) or score < bestScore then
+      bestScore = score
+      bestDef = def
+      bestState = state
+    end
+  end
+
+  if primaryDef and CooldownAvailable(primaryDef) then
+    Consider(primaryDef)
+  end
+
+  local i = 1
+  while i <= table.getn(COOLDOWNS) do
+    local def = COOLDOWNS[i]
+    Consider(def)
+    i = i + 1
+  end
+
+  return bestDef, bestState
+end
+
+-------------------------------------------------
 -- UI
 -------------------------------------------------
 WCM.UI = WCM.UI or {}
@@ -742,91 +959,6 @@ local function ApplyIconState(tex, mode, isPrimary)
     tex:SetWidth(22)
     tex:SetHeight(22)
   end
-end
-
-local function MakeFinalPrimary(elapsed, predicted)
-  if not S().strictFinalStack then return nil end
-  local remaining = predicted - elapsed
-  if remaining < 0 then remaining = 0 end
-  if remaining > 30 then return nil end
-
-  local bestId = nil
-  local bestScore = nil
-
-  local i = 1
-  while i <= table.getn(COOLDOWNS) do
-    local def = COOLDOWNS[i]
-    if def.anchorRem and CooldownAvailable(def) and CooldownReady(def) then
-      local diff = Abs(remaining - def.anchorRem)
-      local score = diff + (def.prio or 50) * 0.01
-      if not bestScore or score < bestScore then
-        bestScore = score
-        bestId = def.id
-      end
-    end
-    i = i + 1
-  end
-
-  return bestId
-end
-
-local function PickNextAction(elapsed, predicted, primaryId)
-  if primaryId then
-    local i = 1
-    while i <= table.getn(COOLDOWNS) do
-      local def = COOLDOWNS[i]
-      if def.id == primaryId then
-        return def
-      end
-      i = i + 1
-    end
-  end
-
-  local best = nil
-  local bestScore = nil
-
-  local i = 1
-  while i <= table.getn(COOLDOWNS) do
-    local def = COOLDOWNS[i]
-    if CooldownAvailable(def) and CooldownReady(def) then
-      local cd = def.cd
-      if def.cdKey == "trinketCD" then
-        cd = tonumber(S().trinketCD) or 120
-      end
-
-      local lose = LoseAUseNow(elapsed, predicted, cd) and 1 or 0
-      local rem = predicted - elapsed
-      if rem < 0 then rem = 0 end
-
-      local score = 9999
-      if lose == 1 then
-        score = 0 + (def.prio or 50) * 0.01
-      else
-        if def.anchorRem then
-          score = Abs(rem - def.anchorRem) + (def.prio or 50) * 0.01
-        else
-          score = 100 + (def.prio or 50) * 0.01
-        end
-      end
-
-      if not bestScore or score < bestScore then
-        bestScore = score
-        best = def
-      end
-    end
-    i = i + 1
-  end
-
-  return best
-end
-
-local function MakeFinalPrimaryAndNext(elapsed, predicted)
-  local primaryId = MakeFinalPrimary(elapsed, predicted)
-  local nextDef = nil
-  if S().showNextAction then
-    nextDef = PickNextAction(elapsed, predicted, primaryId)
-  end
-  return primaryId, nextDef
 end
 
 local function MakeLabel(parent, text, x, y)
@@ -867,6 +999,47 @@ local function AddSpecialFrame(name)
     i = i + 1
   end
   table.insert(UISpecialFrames, name)
+end
+
+local function AcquireIcon(ui)
+  ui.iconPoolUsed = ui.iconPoolUsed + 1
+  local idx = ui.iconPoolUsed
+  if not ui.iconPool[idx] then
+    local t = ui.frame:CreateTexture(nil, "OVERLAY")
+    t:SetWidth(22)
+    t:SetHeight(22)
+    t:SetTexture(ICONS.UNKNOWN)
+    t:SetAlpha(0.2)
+    t:Hide()
+    ui.iconPool[idx] = t
+  end
+  local tex = ui.iconPool[idx]
+  tex:Show()
+  return tex
+end
+
+local function ReleaseIcons(ui)
+  local i = 1
+  while i <= ui.iconPoolUsed do
+    ui.iconPool[i]:Hide()
+    i = i + 1
+  end
+  ui.iconPoolUsed = 0
+end
+
+local function TimeToBarX(ui, t, vStart, vEnd)
+  local barLeft = 46
+  local barRight = ui.frame:GetWidth() - 2
+  local barW = barRight - barLeft
+  if barW < 1 then barW = 1 end
+
+  local frac = 0
+  local span = vEnd - vStart
+  if span > 0 then
+    frac = (t - vStart) / span
+  end
+  frac = Clamp(frac, 0, 1)
+  return barLeft + (barW * frac)
 end
 
 function WCM.UI:Create()
@@ -913,17 +1086,22 @@ function WCM.UI:Create()
   mode:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 6, 4)
   mode:SetText("")
 
-  local na = CreateFrame("Frame", "WCM_NextAction", f)
-  na:SetWidth(40)
-  na:SetHeight(40)
-  na:SetPoint("LEFT", f, "LEFT", 2, -8)
-  na:SetFrameStrata("HIGH")
-  na:SetFrameLevel(200)
+  local ap = CreateFrame("Frame", "WCM_ActionPrompt", f)
+  ap:SetWidth(40)
+  ap:SetHeight(40)
+  ap:SetPoint("LEFT", f, "LEFT", 2, -8)
+  ap:SetFrameStrata("HIGH")
+  ap:SetFrameLevel(200)
 
-  local naTex = na:CreateTexture(nil, "OVERLAY")
-  naTex:SetAllPoints(na)
-  naTex:SetTexture(ICONS.UNKNOWN)
-  naTex:SetAlpha(0.95)
+  local apTex = ap:CreateTexture(nil, "OVERLAY")
+  apTex:SetAllPoints(ap)
+  apTex:SetTexture(ICONS.UNKNOWN)
+  apTex:SetAlpha(0.95)
+
+  local apText = ap:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  apText:SetPoint("TOPLEFT", ap, "TOPRIGHT", 6, -2)
+  apText:SetText("")
+  apText:SetJustifyH("LEFT")
 
   f:SetMovable(true)
   f:EnableMouse(true)
@@ -953,8 +1131,9 @@ function WCM.UI:Create()
   self.info = info
   self.mode = mode
 
-  self.nextActionFrame = na
-  self.nextActionTex = naTex
+  self.promptFrame = ap
+  self.promptTex = apTex
+  self.promptText = apText
 
   self.iconPool = {}
   self.iconPoolUsed = 0
@@ -1050,77 +1229,6 @@ function WCM.UI:Hide()
   self.frame:Hide()
 end
 
-local function AcquireIcon(ui)
-  ui.iconPoolUsed = ui.iconPoolUsed + 1
-  local idx = ui.iconPoolUsed
-  if not ui.iconPool[idx] then
-    local t = ui.frame:CreateTexture(nil, "OVERLAY")
-    t:SetWidth(22)
-    t:SetHeight(22)
-    t:SetTexture(ICONS.UNKNOWN)
-    t:SetAlpha(0.2)
-    t:Hide()
-    ui.iconPool[idx] = t
-  end
-  local tex = ui.iconPool[idx]
-  tex:Show()
-  return tex
-end
-
-local function ReleaseIcons(ui)
-  local i = 1
-  while i <= ui.iconPoolUsed do
-    ui.iconPool[i]:Hide()
-    i = i + 1
-  end
-  ui.iconPoolUsed = 0
-end
-
-local function GetVisibleRange(elapsed, predicted)
-  local vStart = 0
-  local vEnd = predicted
-
-  if S().executeZoom and WCM.state.execute then
-    if S().executeZoomByPct then
-      local thr = tonumber(S().executeThreshold) or 20
-      thr = Clamp(thr, 1, 99)
-      local win = predicted * (thr / 100)
-      if win < 5 then win = 5 end
-      vEnd = predicted
-      vStart = predicted - win
-      if vStart < 0 then vStart = 0 end
-    else
-      local win2 = tonumber(S().executeZoomWindow) or 30
-      win2 = Clamp(win2, 10, 120)
-      vEnd = predicted
-      vStart = predicted - win2
-      if vStart < 0 then vStart = 0 end
-    end
-  end
-
-  if vEnd <= vStart then
-    vStart = 0
-    vEnd = predicted
-  end
-
-  return vStart, vEnd
-end
-
-local function TimeToBarX(ui, t, vStart, vEnd)
-  local barLeft = 46
-  local barRight = ui.frame:GetWidth() - 2
-  local barW = barRight - barLeft
-  if barW < 1 then barW = 1 end
-
-  local frac = 0
-  local span = vEnd - vStart
-  if span > 0 then
-    frac = (t - vStart) / span
-  end
-  frac = Clamp(frac, 0, 1)
-  return barLeft + (barW * frac)
-end
-
 function WCM.UI:UpdateTimeline(elapsed, predicted)
   if not self.frame or not self.frame:IsShown() then return end
 
@@ -1167,19 +1275,31 @@ function WCM.UI:UpdateTimeline(elapsed, predicted)
 
   ReleaseIcons(self)
 
-  local hw = S().highlightWindow or 0.7
-  local soonW = S().incomingWindow or 4.0
+  local hw = tonumber(S().highlightWindow) or 0.7
+  local soonW = tonumber(S().incomingWindow) or 4.0
 
-  local primaryId, nextDef = MakeFinalPrimaryAndNext(elapsed, predicted)
+  local primaryId = MakeFinalPrimary(elapsed, predicted)
+  local promptDef, promptState = nil, nil
+  if S().showPrompt then
+    promptDef, promptState = PickBestPrompt(elapsed, predicted, primaryId)
+  end
 
-  if S().showNextAction and nextDef then
-    self.nextActionFrame:Show()
-    self.nextActionFrame:SetFrameStrata("HIGH")
-    self.nextActionFrame:SetFrameLevel(200)
-    self.nextActionTex:SetTexture(CooldownTexture(nextDef))
-    self.nextActionTex:SetAlpha(0.98)
+  if S().showPrompt and promptDef and promptState then
+    if S().promptOnlyPressNow and promptState ~= "PRESS NOW" then
+      self.promptFrame:Hide()
+      self.promptText:SetText("")
+    else
+      self.promptFrame:Show()
+      self.promptFrame:SetFrameStrata("HIGH")
+      self.promptFrame:SetFrameLevel(200)
+      self.promptTex:SetTexture(CooldownTexture(promptDef))
+      self.promptTex:SetAlpha(0.98)
+      self.promptText:SetText(promptState)
+      self.promptText:Show()
+    end
   else
-    self.nextActionFrame:Hide()
+    self.promptFrame:Hide()
+    if self.promptText then self.promptText:SetText("") end
   end
 
   local di = 1
@@ -1187,15 +1307,9 @@ function WCM.UI:UpdateTimeline(elapsed, predicted)
     local def = COOLDOWNS[di]
 
     if CooldownAvailable(def) then
-      local cd = def.cd
-      if def.cdKey == "trinketCD" then
-        cd = tonumber(S().trinketCD) or 120
-      end
-
+      local cd = GetDefCooldownSeconds(def)
       local sched = BuildSchedule(predicted, cd, def.dur)
       local ready = CooldownReady(def)
-      local loseNow = false
-      if ready then loseNow = LoseAUseNow(elapsed, predicted, cd) end
 
       local si = 1
       while si <= table.getn(sched) do
@@ -1218,10 +1332,9 @@ function WCM.UI:UpdateTimeline(elapsed, predicted)
           elseif absdt <= soonW and ready then
             mode2 = "soon"
           end
-          if loseNow and ready then mode2 = "now" end
 
           local isPrimary = false
-          if nextDef and def.id == nextDef.id and mode2 == "now" then
+          if promptDef and promptState == "PRESS NOW" and def.id == promptDef.id and mode2 == "now" then
             isPrimary = true
           end
 
@@ -1289,6 +1402,9 @@ function WCM.Options:SyncFromDB()
   if self.autoHideCB and self.autoHideCB.SetChecked then self.autoHideCB:SetChecked(S().autoHideOOC and true or false) end
   if self.lockBossCB and self.lockBossCB.SetChecked then self.lockBossCB:SetChecked(S().lockToBoss and true or false) end
 
+  if self.showPromptCB and self.showPromptCB.SetChecked then self.showPromptCB:SetChecked(S().showPrompt and true or false) end
+  if self.promptOnlyNowCB and self.promptOnlyNowCB.SetChecked then self.promptOnlyNowCB:SetChecked(S().promptOnlyPressNow and true or false) end
+
   self._syncing = false
 end
 
@@ -1297,7 +1413,7 @@ function WCM.Options:Create()
 
   local f = CreateFrame("Frame", "WCM_Options", UIParent)
   f:SetWidth(520)
-  f:SetHeight(500)
+  f:SetHeight(520)
   f:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
 
   if f.SetBackdrop then
@@ -1310,11 +1426,9 @@ function WCM.Options:Create()
     f:SetBackdropColor(0, 0, 0, 0.90)
   end
 
-  -- Make it ALWAYS on top
   f:SetFrameStrata("FULLSCREEN_DIALOG")
   f:SetFrameLevel(999)
 
-  -- Make it movable
   f:SetMovable(true)
   f:EnableMouse(true)
   f:RegisterForDrag("LeftButton")
@@ -1501,26 +1615,8 @@ function WCM.Options:Create()
     Print("Live prediction " .. (S().livePredict and "enabled" or "disabled"))
   end)
 
-  local sf = CreateFrame("CheckButton", "WCM_Options_StrictFinal", f, "UICheckButtonTemplate")
-  sf:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -362)
-  getglobal(sf:GetName() .. "Text"):SetText("Strict final stacking window (last 30s)")
-  sf:SetChecked(S().strictFinalStack and true or false)
-  sf:SetScript("OnClick", function()
-    S().strictFinalStack = sf:GetChecked() and true or false
-    Print("Strict final stack " .. (S().strictFinalStack and "enabled" or "disabled"))
-  end)
-
-  local na = CreateFrame("CheckButton", "WCM_Options_NextAction", f, "UICheckButtonTemplate")
-  na:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -388)
-  getglobal(na:GetName() .. "Text"):SetText("Show Next Action icon")
-  na:SetChecked(S().showNextAction and true or false)
-  na:SetScript("OnClick", function()
-    S().showNextAction = na:GetChecked() and true or false
-    Print("Next action icon " .. (S().showNextAction and "enabled" or "disabled"))
-  end)
-
   local xr = CreateFrame("CheckButton", "WCM_Options_ExecRed", f, "UICheckButtonTemplate")
-  xr:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -414)
+  xr:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -362)
   getglobal(xr:GetName() .. "Text"):SetText("Execute makes bar red")
   xr:SetChecked(S().executeBarRed and true or false)
   xr:SetScript("OnClick", function()
@@ -1578,6 +1674,24 @@ function WCM.Options:Create()
     Print("Test auto stop " .. (S().testAutoStop and "enabled" or "disabled"))
   end)
 
+  local sp = CreateFrame("CheckButton", "WCM_Options_ShowPrompt", f, "UICheckButtonTemplate")
+  sp:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -448)
+  getglobal(sp:GetName() .. "Text"):SetText("Action Prompt enabled (left icon)")
+  sp:SetChecked(S().showPrompt and true or false)
+  sp:SetScript("OnClick", function()
+    S().showPrompt = sp:GetChecked() and true or false
+    Print("Action prompt " .. (S().showPrompt and "enabled" or "disabled"))
+  end)
+
+  local pnow = CreateFrame("CheckButton", "WCM_Options_PromptOnlyNow", f, "UICheckButtonTemplate")
+  pnow:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -474)
+  getglobal(pnow:GetName() .. "Text"):SetText("Prompt only when PRESS NOW")
+  pnow:SetChecked(S().promptOnlyPressNow and true or false)
+  pnow:SetScript("OnClick", function()
+    S().promptOnlyPressNow = pnow:GetChecked() and true or false
+    Print("Prompt mode = " .. (S().promptOnlyPressNow and "press-now only" or "always show states"))
+  end)
+
   self.frame = f
   self.xSlider = xs
   self.ySlider = ys
@@ -1588,6 +1702,8 @@ function WCM.Options:Create()
   self.zoomBox = zBox
   self.autoHideCB = ah
   self.lockBossCB = lb
+  self.showPromptCB = sp
+  self.promptOnlyNowCB = pnow
 
   f:SetScript("OnShow", function()
     WCM.Options:UpdatePosSliderRanges()
@@ -1804,7 +1920,8 @@ SlashCmdList["WCM"] = function(msg)
       Print("usage: /wcm hist <bossname>")
     end
   elseif msg == "diag" then
-    Print("diag: autoHideOOC=" .. tostring(S().autoHideOOC) ..
+    Print("diag: preferAlign=" .. tostring(S().preferAlign) ..
+      " autoHideOOC=" .. tostring(S().autoHideOOC) ..
       " inCombat=" .. tostring(InCombat()) ..
       " running=" .. tostring(WCM.state.running) ..
       " boss=" .. tostring(WCM.state.boss) ..
@@ -1813,7 +1930,9 @@ SlashCmdList["WCM"] = function(msg)
       " method=" .. tostring(WCM.BW and WCM.BW.method) ..
       " lockToBoss=" .. tostring(S().lockToBoss) ..
       " bossGUID=" .. tostring(WCM.state.bossGUID) ..
-      " bossNameLock=" .. tostring(WCM.state.bossNameLock))
+      " bossNameLock=" .. tostring(WCM.state.bossNameLock) ..
+      " showPrompt=" .. tostring(S().showPrompt) ..
+      " promptOnlyPressNow=" .. tostring(S().promptOnlyPressNow))
   else
     Print("/wcm show | hide | opt | start [sec] | stop | hist <boss> | diag")
   end
