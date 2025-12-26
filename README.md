@@ -1,6 +1,7 @@
 # WarriorCombatManager (WCM)
 
 WarriorCombatManager is a lightweight timeline helper for TurtleWoW (SuperWoW supported setups) that helps you **plan and execute cooldown stacking** on boss fights.
+![1](https://github.com/user-attachments/assets/ed976f63-c528-409d-bf14-e2b0a9b5f941)
 
 It combines:
 - **Boss kill time history** (via BigWigs BossRecords when available),
@@ -32,6 +33,7 @@ This addon does not play the game for you. It just makes it harder to mess up yo
 - Optional behavior:
   - Turn the bar red during Execute phase.
   - Zoom into the Execute window so icons do not overlap and the timeline becomes easier to read.
+![2](https://github.com/user-attachments/assets/50dd3941-a40e-459d-89ce-3635c679f97d)
 
 ### Trinket Intelligence
 - Automatically reads your equipped trinkets (slot 13 and 14).
@@ -49,6 +51,8 @@ This addon does not play the game for you. It just makes it harder to mess up yo
   - Always on top
   - Close button (X) and ESC support
 - Auto-hide out of combat (optional).
+![3](https://github.com/user-attachments/assets/a3b1e6fd-afa5-4bcd-80d6-0c3876d47c48)
+![4](https://github.com/user-attachments/assets/456e7cd9-ce41-4463-be52-6548bc2d95d7)
 
 ---
 
